@@ -1,0 +1,451 @@
+"""
+Apka OCR-fakturowa Autos.
+
+Zakładki:
+  • KROK 2 — Odczyt faktury (OCR/tekst): upload -> odczyt pozycji -> walidacja ->
+    lookup indeksu wewnętrznego -> tabela -> obsługa pozycji BRAK (usuń / dopasuj) ->
+    eksport CSV dla fakt_filler.
+  • KROK 1 — Lookup dostawców (ręczne sprawdzanie pozycji).
+
+Trwała pamięć decyzji (czarna lista + wyuczone dopasowania) w Firestore.
+Lookup: plik-na-dysku (indeksy_dostawcow.json w repo).
+OCR/tekst: digital-first (tekst PDF), OCR vision jako fallback (Vertex AI).
+"""
+from __future__ import annotations
+
+import io
+import csv
+
+import pandas as pd
+import streamlit as st
+
+from indeks_lookup import LookupDostawcow
+import pamiec_dopasowan as pdop
+
+CACHE_PATH = "indeksy_dostawcow.json"
+
+st.set_page_config(page_title="Autos — faktury", page_icon="🔧", layout="wide")
+
+
+@st.cache_resource(show_spinner="Ładuję dane z pliku...")
+def zaladuj_lookup() -> LookupDostawcow:
+    return LookupDostawcow(CACHE_PATH)
+
+
+@st.cache_resource(show_spinner="Łączę z Firestore...")
+def polacz_firestore():
+    """Zwraca (db, blad). Cache_resource = jedno połączenie na sesję."""
+    if "FIREBASE_CREDS" not in st.secrets:
+        return None, "Brak FIREBASE_CREDS w Secrets — pamięć dopasowań wyłączona."
+    return pdop.init_firestore(st.secrets)
+
+
+
+def _wiersz(p, indeks_wew: str, dopasowanie: str) -> dict:
+    """Buduje słownik jednego wiersza tabeli z pozycji odczytanej faktury."""
+    return {
+        "lp": p.lp,
+        "indeks_dostawcy": p.indeks,
+        "ilosc": p.ilosc,
+        "cena": p.cena_netto,
+        "indeks_wewnetrzny": indeks_wew,
+        "dopasowanie": dopasowanie,
+        "arytmetyka": ("OK" if p.arytmetyka_ok else "BŁĄD") if p.arytmetyka_ok is not None else "—",
+        "uwaga": p.uwaga,
+    }
+
+st.title("🔧 Autos — faktury zakupowe")
+
+try:
+    lookup = zaladuj_lookup()
+except FileNotFoundError:
+    st.error(f"Nie znaleziono pliku **{CACHE_PATH}** (musi być w repo obok app.py).")
+    st.stop()
+except Exception as e:
+    st.error(f"Nie udało się wczytać danych z {CACHE_PATH}.\n\nSzczegóły: {e}")
+    st.stop()
+
+# Firestore — opcjonalny; bez niego apka działa, tylko bez trwałej pamięci
+db, blad_fs = polacz_firestore()
+
+
+# ── pomocnicze: wczytanie pamięci (czarna lista + dopasowania) z cache sesji ──
+def odswiez_pamiec():
+    """Ładuje czarną listę i dopasowania do session_state (raz, z możliwością odświeżenia)."""
+    if db is None:
+        st.session_state["_czarna"] = set()
+        st.session_state["_dopas"] = {}
+        return
+    st.session_state["_czarna"] = pdop.wczytaj_czarna_liste(db)
+    st.session_state["_dopas"] = pdop.wczytaj_dopasowania(db)
+
+
+if "_czarna" not in st.session_state or "_dopas" not in st.session_state:
+    odswiez_pamiec()
+
+
+tab_ocr, tab_lookup, tab_pamiec = st.tabs(
+    ["📄 Odczyt faktury", "🔍 Lookup dostawców", "🧠 Pamięć dopasowań"]
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ZAKŁADKA 1 — ODCZYT FAKTURY
+# ══════════════════════════════════════════════════════════════════════════
+with tab_ocr:
+    st.subheader("Odczyt faktury i przygotowanie do wpisania")
+    st.caption(
+        "PDF cyfrowy czytany z tekstu (dokładnie), skan/zdjęcie przez OCR. Apka sprawdza "
+        "arytmetykę, dopasowuje indeksy wewnętrzne i przygotowuje CSV dla fakt_filler. "
+        "**Nic nie idzie do maggo automatycznie — Ty zatwierdzasz.**"
+    )
+
+    if blad_fs:
+        st.warning(f"⚠️ {blad_fs} Akcje 'usuń trwale' i 'zapamiętaj dopasowanie' nie zadziałają, "
+                   "dopóki nie dodasz FIREBASE_CREDS do Secrets.")
+
+    brak_sekretow = [k for k in ("FIREBASE_CREDS", "GCP_PROJECT_IDS") if k not in st.secrets]
+    if brak_sekretow:
+        st.info(
+            "Do OCR skanów potrzebny Vertex AI. Brakuje w Secrets: "
+            f"**{', '.join(brak_sekretow)}**. Cyfrowe PDF (z tekstem) zadziałają i bez tego."
+        )
+
+    plik = st.file_uploader("Faktura (PDF / JPG / PNG)",
+                            type=["pdf", "jpg", "jpeg", "png", "webp"],
+                            accept_multiple_files=False)
+
+    if plik is not None:
+        if st.button("📖 Odczytaj fakturę", type="primary"):
+            # nowy odczyt — czyścimy stan poprzedniego (decyzje per-pozycja)
+            for k in list(st.session_state.keys()):
+                if k.startswith("akcja_") or k.startswith("szukaj_") or k == "ocr_wynik" or k == "reczne_dopas":
+                    del st.session_state[k]
+            st.session_state["reczne_dopas"] = {}  # lp -> (indeks_wew, nazwa) wybrane w tej sesji
+
+            with st.spinner("Czytam fakturę..."):
+                try:
+                    import vision_ocr
+                except Exception as e:
+                    st.error(f"Nie udało się załadować modułu odczytu: {e}")
+                    st.stop()
+                wynik, err = vision_ocr.odczytaj_fakture(
+                    file_bytes=plik.getvalue(), nazwa_pliku=plik.name, secrets=st.secrets)
+            if err:
+                st.error(f"❌ {err}")
+            else:
+                st.session_state["ocr_wynik"] = wynik
+
+    wynik = st.session_state.get("ocr_wynik")
+    if wynik is not None:
+        st.divider()
+
+        # nagłówek
+        st.markdown("#### Odczytana faktura")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pozycji (odczytane)", wynik.liczba_pozycji)
+        c2.metric("Suma netto (pozycje)", f"{wynik.suma_netto_pozycji:,.2f}".replace(",", " ")
+                  if wynik.suma_netto_pozycji is not None else "—")
+        c3.metric("Suma netto (faktura)", f"{wynik.suma_netto_faktury:,.2f}".replace(",", " ")
+                  if wynik.suma_netto_faktury is not None else "—")
+
+        linia = []
+        if wynik.dostawca: linia.append(f"dostawca: **{wynik.dostawca}**")
+        if wynik.numer_dokumentu: linia.append(f"dokument: {wynik.numer_dokumentu}")
+        if wynik.data: linia.append(f"data: {wynik.data}")
+        if wynik.waluta: linia.append(f"waluta: {wynik.waluta}")
+        if linia: st.caption(" · ".join(linia))
+
+        if getattr(wynik, "zrodlo_odczytu", "") == "tekst PDF":
+            st.success("📝 Odczytano z **warstwy tekstowej PDF** (dokładne — bez OCR).")
+        elif getattr(wynik, "zrodlo_odczytu", "") == "OCR (vision)":
+            st.info("👁️ Odczytano przez **OCR (Gemini Vision)** — skan/zdjęcie. Zerknij na pozycje.")
+
+        if wynik.suma_ok is True:
+            st.success("✅ Suma pozycji zgadza się z sumą na fakturze.")
+        elif wynik.suma_ok is False:
+            st.error("⚠️ Suma pozycji NIE zgadza się z sumą na fakturze — sprawdź wiersze niżej.")
+        for o in wynik.ostrzezenia:
+            st.warning(o)
+
+        # ── przetwarzanie pozycji: czarna lista -> wyuczone -> lookup ──
+        czarna = st.session_state.get("_czarna", set())
+        dopas = st.session_state.get("_dopas", {})
+        reczne = st.session_state.get("reczne_dopas", {})   # lp -> (indeks_wew, nazwa)
+        dostawca = wynik.dostawca or ""
+
+        wiersze = []
+        pozycje_brak = []   # pozycje wymagające decyzji (BRAK i jeszcze nieobsłużone)
+        pominiete_czarna = 0
+
+        for p in wynik.pozycje:
+            # 1) czarna lista -> pomiń całkowicie
+            if dostawca and pdop.na_czarnej_liscie(czarna, dostawca, p.indeks):
+                pominiete_czarna += 1
+                continue
+
+            # 2) ręczny wybór w tej sesji (kliknięte "użyj")
+            if p.lp in reczne:
+                iw, nz = reczne[p.lp]
+                wiersze.append(_wiersz(p, iw, "ręczne (ta sesja)"))
+                continue
+
+            # 3) wyuczone dopasowanie z Firestore
+            if dostawca:
+                iw = pdop.pobierz_wyuczone(dopas, dostawca, p.indeks)
+                if iw:
+                    wiersze.append(_wiersz(p, iw, "wyuczone"))
+                    continue
+
+            # 4) zwykły lookup
+            res = lookup.znajdz(dostawca, p.indeks) if dostawca else None
+            if res is None:
+                wiersze.append(_wiersz(p, "", "BRAK"))
+                pozycje_brak.append(p)
+            else:
+                wiersze.append(_wiersz(p, res.indeks_glowny, res.dopasowanie))
+
+        df = pd.DataFrame(wiersze)
+
+        # podsumowanie
+        dokladne = (df["dopasowanie"] == "dokladne").sum() if len(df) else 0
+        znorm = (df["dopasowanie"] == "znormalizowane").sum() if len(df) else 0
+        wyu = (df["dopasowanie"].isin(["wyuczone", "ręczne (ta sesja)"])).sum() if len(df) else 0
+        brak_n = (df["dopasowanie"] == "BRAK").sum() if len(df) else 0
+
+        st.markdown("#### Pozycje + dopasowanie indeksów")
+        info_bits = [f"dokładne: **{dokladne}**", f"znormalizowane: **{znorm}**",
+                     f"wyuczone/ręczne: **{wyu}**", f"BRAK: **{brak_n}**"]
+        if pominiete_czarna:
+            info_bits.append(f"pominięte (czarna lista): **{pominiete_czarna}**")
+        st.caption(" · ".join(info_bits))
+
+        st.caption(
+            "Tabela jest poglądowa (możesz w niej poprawić wartości). Pozycje **BRAK** "
+            "obsłuż w sekcji pod tabelą — usuń trwale albo dopasuj podobną z bazy."
+        )
+        df_edit = st.data_editor(
+            df, use_container_width=True, hide_index=True,
+            column_config={
+                "lp": st.column_config.NumberColumn("Lp", disabled=True, width="small"),
+                "indeks_dostawcy": st.column_config.TextColumn("Indeks dostawcy"),
+                "ilosc": st.column_config.NumberColumn("Ilość"),
+                "cena": st.column_config.NumberColumn("Cena netto", format="%.2f"),
+                "indeks_wewnetrzny": st.column_config.TextColumn("Indeks wewnętrzny"),
+                "dopasowanie": st.column_config.TextColumn("Dopasowanie", disabled=True),
+                "arytmetyka": st.column_config.TextColumn("Arytm.", disabled=True, width="small"),
+                "uwaga": st.column_config.TextColumn("Uwaga"),
+            },
+            key="ocr_tabela",
+        )
+
+        # ══ sekcja decyzji dla pozycji BRAK ══
+        if pozycje_brak:
+            st.divider()
+            st.markdown(f"#### ⚠️ Pozycje bez dopasowania ({len(pozycje_brak)}) — wymagają decyzji")
+            st.caption(
+                "Dla każdej: **Usuń z listy** (trwale — już nigdy się nie pojawi, nie wejdzie do CSV) "
+                "albo **Szukaj podobnych** (przeszukuje całą bazę, literówki/fragmenty; po wyborze "
+                "zapamiętuje na stałe)."
+            )
+
+            for p in pozycje_brak:
+                with st.container(border=True):
+                    cl, cr = st.columns([3, 2])
+                    with cl:
+                        st.markdown(f"**Lp {p.lp}** · indeks dostawcy: `{p.indeks}`")
+                        st.caption(f"ilość: {p.ilosc} · cena netto: {p.cena_netto}")
+                    with cr:
+                        b1, b2 = st.columns(2)
+                        # USUŃ TRWALE
+                        if b1.button("✖ Usuń z listy", key=f"akcja_usun_{p.lp}",
+                                     help="Trwale — nie pojawi się w przyszłych odczytach",
+                                     use_container_width=True):
+                            if db is None:
+                                st.error("Brak Firestore — nie mogę zapisać trwale.")
+                            else:
+                                ok = pdop.dodaj_do_czarnej_listy(db, dostawca, p.indeks)
+                                if ok:
+                                    odswiez_pamiec()
+                                    st.success(f"Usunięto trwale: {p.indeks}")
+                                    st.rerun()
+                                else:
+                                    st.error("Nie udało się zapisać.")
+                        # SZUKAJ PODOBNYCH
+                        if b2.button("🔍 Szukaj podobnych", key=f"szukaj_btn_{p.lp}",
+                                     use_container_width=True):
+                            st.session_state[f"szukaj_open_{p.lp}"] = True
+
+                    # rozwinięcie: kandydaci
+                    if st.session_state.get(f"szukaj_open_{p.lp}"):
+                        kandydaci = pdop.szukaj_podobnych(lookup, p.indeks, maks=8)
+                        if not kandydaci:
+                            st.info("Nie znalazłem podobnych w bazie. Wpisz indeks wewnętrzny "
+                                    "ręcznie w tabeli wyżej, jeśli ta pozycja ma wejść do CSV.")
+                        else:
+                            st.caption(f"Znalezione podobne dla `{p.indeks}` (od najlepszego):")
+                            for i, k in enumerate(kandydaci):
+                                kc1, kc2 = st.columns([5, 1])
+                                with kc1:
+                                    st.markdown(
+                                        f"**{k.indeks_wewnetrzny}** — {k.nazwa or '(bez nazwy)'}  \n"
+                                        f"<small>{k.powod} · u dostawcy *{k.dostawca_zrodlowy}* "
+                                        f"jako `{k.indeks_dostawcy}`</small>",
+                                        unsafe_allow_html=True)
+                                with kc2:
+                                    if st.button("✓ Użyj", key=f"uzyj_{p.lp}_{i}",
+                                                 use_container_width=True):
+                                        # zapamiętaj na stałe + zastosuj w tej sesji
+                                        if db is not None:
+                                            pdop.zapisz_dopasowanie(
+                                                db, dostawca, p.indeks,
+                                                k.indeks_wewnetrzny, k.nazwa)
+                                            odswiez_pamiec()
+                                        st.session_state.setdefault("reczne_dopas", {})[p.lp] = \
+                                            (k.indeks_wewnetrzny, k.nazwa)
+                                        st.session_state[f"szukaj_open_{p.lp}"] = False
+                                        st.success(f"Przypisano {k.indeks_wewnetrzny} do Lp {p.lp} "
+                                                   "i zapamiętano na stałe.")
+                                        st.rerun()
+
+        # ══ eksport CSV ══
+        st.divider()
+        st.markdown("#### Eksport dla fakt_filler")
+        gotowe = df_edit[df_edit["indeks_wewnetrzny"].astype(str).str.strip() != ""].copy()
+        bez_indeksu = len(df_edit) - len(gotowe)
+        st.caption(
+            f"Do CSV trafi **{len(gotowe)}** pozycji z indeksem wewnętrznym."
+            + (f" Pominięto **{bez_indeksu}** bez indeksu (obsłuż je wyżej albo uzupełnij w tabeli)."
+               if bez_indeksu else "")
+        )
+        if len(gotowe):
+            buf = io.StringIO()
+            w = csv.writer(buf)
+            w.writerow(["indeksDost", "ilosc", "cena"])
+            for _, r in gotowe.iterrows():
+                cena, ilosc = r["cena"], r["ilosc"]
+                w.writerow([
+                    str(r["indeks_wewnetrzny"]).strip(),
+                    "" if pd.isna(ilosc) else (int(ilosc) if float(ilosc).is_integer() else ilosc),
+                    "" if pd.isna(cena) else f"{float(cena):.2f}",
+                ])
+            nazwa_csv = f"pozycje_{(wynik.numer_dokumentu or 'faktura').replace('/', '_')}.csv"
+            st.download_button("⬇️ Pobierz CSV dla fakt_filler", data=buf.getvalue().encode("utf-8"),
+                               file_name=nazwa_csv, mime="text/csv", type="primary")
+            st.caption("CSV wgrywasz lokalnie przez fakt_filler.py (apka w chmurze nie ma dostępu do maggo).")
+
+        with st.expander("🐛 Surowa odpowiedź modelu (debug)"):
+            st.caption(f"Źródło: {getattr(wynik, 'zrodlo_odczytu', '?')} · Model: {wynik.model}")
+            st.code(wynik.raw_odpowiedz, language="json")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ZAKŁADKA 2 — LOOKUP
+# ══════════════════════════════════════════════════════════════════════════
+with tab_lookup:
+    st.subheader("Lookup dostawców")
+    st.caption("Ręczne sprawdzanie: dostawca + indeks z faktury → indeks wewnętrzny.")
+
+    meta = lookup._cache.get("_meta", {})
+    wiek = lookup.wiek_cache_godzin()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Wpisów (źródło)", meta.get("wierszy_uwzglednionych", meta.get("wierszy_pobranych", "—")))
+    c2.metric("Dostawców", meta.get("unikalnych_dostawcow", len(lookup.lista_dostawcow())))
+    c3.metric("Artykułów", meta.get("unikalnych_artykulow", "—"))
+
+    linia = []
+    if wiek is not None:
+        linia.append(f"dane zbudowane {wiek:.1f} h temu" if wiek < 48 else f"dane zbudowane {wiek/24:.0f} dni temu")
+    if meta.get("zrodlo"): linia.append(f"źródło: {meta['zrodlo']}")
+    if meta.get("konflikty_normalizacji"): linia.append(f"konfliktów normalizacji: {meta['konflikty_normalizacji']}")
+    if linia: st.caption(" · ".join(linia))
+
+    st.divider()
+    with st.form("lookup_form"):
+        nazwa_dostawcy = st.text_input("Nazwa dostawcy (jak na fakturze)", placeholder="np. INTER CARS S.A.")
+        indeks = st.text_input("Indeks z faktury", placeholder="np. N.40000.S05.H100")
+        szukaj = st.form_submit_button("Szukaj", type="primary")
+
+    if szukaj:
+        if not nazwa_dostawcy.strip() or not indeks.strip():
+            st.warning("Podaj nazwę dostawcy i indeks.")
+        else:
+            res = lookup.znajdz(nazwa_dostawcy.strip(), indeks.strip())
+            if res is None:
+                st.error("❌ Nie znaleziono tej pozycji.")
+                kanon = lookup._dopasuj_dostawce(nazwa_dostawcy.strip())
+                if kanon:
+                    st.info(f"Dostawcę rozpoznano jako: **{kanon}** — ale tego indeksu u niego nie ma.")
+                else:
+                    st.info("Tego dostawcy w ogóle nie ma w danych (sprawdź pisownię).")
+            else:
+                etykieta = "dokładne" if res.dopasowanie == "dokladne" else "znormalizowane"
+                st.success(f"✅ Znaleziono (dopasowanie {etykieta}): **{res.indeks_glowny}**")
+                if res.dopasowanie != "dokladne":
+                    st.warning("Dopasowano przez normalizację (możliwa literówka).")
+                kol1, kol2 = st.columns(2)
+                with kol1:
+                    st.write("**Indeks wewnętrzny:**", res.indeks_glowny)
+                    st.write("**Nazwa:**", res.nazwa)
+                    st.write("**Cena netto (katalogowa):**", res.cena_netto)
+                with kol2:
+                    st.write("**Wiodący dostawca:**", "tak" if res.czy_glowny else "nie")
+                    st.write("**Data aktualizacji ceny:**", res.data_aktualizacji)
+
+    st.divider()
+    with st.expander(f"Lista dostawców w danych ({len(lookup.lista_dostawcow())})"):
+        for d in lookup.lista_dostawcow():
+            st.write("·", d)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  ZAKŁADKA 3 — PAMIĘĆ DOPASOWAŃ (zarządzanie czarną listą i wyuczonymi)
+# ══════════════════════════════════════════════════════════════════════════
+with tab_pamiec:
+    st.subheader("Pamięć dopasowań")
+    st.caption("Trwałe decyzje zapisane w Firestore: odrzucone pozycje (czarna lista) "
+               "oraz ręcznie nauczone dopasowania. Tu możesz je przejrzeć i cofnąć.")
+
+    if db is None:
+        st.warning(f"⚠️ {blad_fs or 'Brak połączenia z Firestore.'}")
+    else:
+        if st.button("🔄 Odśwież z Firestore"):
+            odswiez_pamiec()
+            st.rerun()
+
+        czarna_docs = []
+        dopas = st.session_state.get("_dopas", {})
+        try:
+            for d in db.collection(pdop._COL_CZARNA).stream():
+                czarna_docs.append(d.to_dict())
+        except Exception as e:
+            st.error(f"Błąd odczytu czarnej listy: {e}")
+
+        st.markdown(f"##### ✖ Czarna lista — odrzucone pozycje ({len(czarna_docs)})")
+        if not czarna_docs:
+            st.caption("(pusto)")
+        else:
+            for w in czarna_docs:
+                cc1, cc2 = st.columns([5, 1])
+                cc1.write(f"`{w.get('indeks_dostawcy','?')}` · dostawca: {w.get('dostawca','?')}")
+                if cc2.button("Cofnij", key=f"cofnij_cz_{w.get('indeks_dostawcy','')}_{w.get('dostawca','')}"):
+                    pdop.usun_z_czarnej_listy(db, w.get("dostawca",""), w.get("indeks_dostawcy",""))
+                    odswiez_pamiec()
+                    st.rerun()
+
+        st.divider()
+        st.markdown(f"##### 🧠 Wyuczone dopasowania ({len(dopas)})")
+        if not dopas:
+            st.caption("(pusto)")
+        else:
+            rows = []
+            for k, w in dopas.items():
+                rows.append({
+                    "indeks dostawcy": w.get("indeks_dostawcy", "?"),
+                    "→ indeks wewnętrzny": w.get("indeks_wewnetrzny", "?"),
+                    "nazwa": w.get("nazwa", ""),
+                    "dostawca": w.get("dostawca", "?"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption("Aby cofnąć konkretne dopasowanie — usuń je w konsoli Firebase "
+                       "(kolekcja faktury_dopasowania) lub poproś o przycisk usuwania per wiersz.")

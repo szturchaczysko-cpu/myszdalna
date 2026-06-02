@@ -1,0 +1,7 @@
+streamlit
+pandas
+google-cloud-aiplatform
+firebase-admin
+pdf2image
+pdfplumber
+pillow
