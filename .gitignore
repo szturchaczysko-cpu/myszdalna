@@ -1,0 +1,22 @@
+# KLUCZ FIREBASE — NIGDY nie commitować!
+firebase_key.json
+*serviceAccount*.json
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Dane lokalne / robocze
+*.csv
+indeksy_dostawcow.json
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
