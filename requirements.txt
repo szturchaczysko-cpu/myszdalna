@@ -1,0 +1,6 @@
+streamlit
+pandas
+google-cloud-aiplatform
+pdf2image
+pdfplumber
+pillow
