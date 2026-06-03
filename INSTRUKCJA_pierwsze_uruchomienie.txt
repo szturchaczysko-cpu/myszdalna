@@ -1,0 +1,70 @@
+============================================================
+  WPISYWANIE FAKTUR DO MAGGO - PIERWSZE URUCHOMIENIE
+============================================================
+
+Ten zestaw pozwala automatycznie wpisywac pozycje faktury do maggo,
+zamiast przepisywac je recznie. Konfiguracje robisz RAZ. Potem przy
+kazdej fakturze to juz tylko klikanie.
+
+------------------------------------------------------------
+  CO POBRAC Z APKI (sekcja "Pliki do wpisywania" na dole)
+------------------------------------------------------------
+  1. fakt_filler.py
+  2. Wpisz_do_maggo.bat
+  3. Wpisz_do_maggo_PROBA.bat   (wersja probna - nic nie wpisuje)
+  4. ta instrukcja
+
+WAZNE: wszystkie pliki musza lezec RAZEM w jednym folderze.
+Zrob na pulpicie folder np. "Maggo wpisywanie" i wrzuc tam te pliki.
+
+------------------------------------------------------------
+  KROK 1 - ZAINSTALUJ PYTHON (tylko raz, jesli nie masz)
+------------------------------------------------------------
+  - Wejdz na: python.org/downloads
+  - Kliknij zolty przycisk "Download Python"
+  - Uruchom pobrany plik.
+  - WAZNE: jesli instalator pokaze okienko z pytaniami (PATH, dlugie
+    sciezki) - na wszystko odpowiadaj TAK / zaznacz haczyk "Add to PATH".
+  - Po instalacji zrestartuj komputer.
+
+  Jak sprawdzic, czy dziala: otworz menu Start, wpisz "powershell",
+  Enter, wpisz: python --version  -> powinno pokazac "Python 3.xx".
+
+------------------------------------------------------------
+  KROK 2 - ZAINSTALUJ DODATKI (tylko raz)
+------------------------------------------------------------
+  Otworz PowerShell (menu Start -> wpisz "powershell" -> Enter)
+  i wpisz kolejno (Enter po kazdej linii):
+
+      pip install playwright requests
+      python -m playwright install chromium
+
+  Poczekaj az obie sie skoncza (druga pobiera przegladarke, chwile trwa).
+
+------------------------------------------------------------
+  KROK 3 - CODZIENNE UZYCIE (przy kazdej fakturze)
+------------------------------------------------------------
+  1. W apce odczytaj fakture i kliknij "Pobierz plik" (pobierze sie
+     plik pozycje_xxx.csv - zapamietaj gdzie).
+  2. Otworz maggo -> wejdz na TE FAKTURE -> zakladka "Pozycje"
+     (musi byc widoczny przycisk "Dodaj").
+  3. Kliknij dwa razy "Wpisz_do_maggo.bat".
+     - otworzy sie przegladarka: zaloguj sie do maggo (jesli trzeba),
+       wejdz na te fakture -> zakladka Pozycje,
+     - wroc do czarnego okna i nacisnij ENTER,
+     - wyskoczy okienko - wskaz pobrany przed chwila plik CSV.
+  4. Pozycje wpisza sie same (zobaczysz liste z OK przy kazdej).
+
+  PORADA: za pierwszym razem uzyj "Wpisz_do_maggo_PROBA.bat" - dziala
+  tak samo, ale NIC nie wpisuje (tylko pokazuje co by zrobil). Bezpieczny
+  test.
+
+------------------------------------------------------------
+  COS NIE DZIALA?
+------------------------------------------------------------
+  - "Nie znaleziono Pythona" -> wroc do KROKU 1 (PATH / restart).
+  - Po pierwszej pozycji leca bledy 403 -> zamknij okno, zaloguj sie
+    swiezo do maggo i uruchom ponownie.
+  - Okno od razu sie zamyka -> uruchom Wpisz_do_maggo_PROBA.bat i
+    przeczytaj komunikat (albo zrob zrzut ekranu).
+============================================================
